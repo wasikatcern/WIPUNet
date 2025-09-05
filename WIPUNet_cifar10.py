@@ -1,4 +1,8 @@
-# --- Local GPU-aware PyTorch setup (no Colab/Drive) ---
+#####################################
+###### Prepared by Wasikul Islam ####
+### contact: wasikul.islam@cern.ch ##
+#####################################
+
 import os, random, torch, shutil
 from datetime import datetime
 from pathlib import Path
@@ -198,81 +202,6 @@ class ResBlock(nn.Module):
         h = self.se(h)
         return F.relu(x + h, inplace=True)
 
-# --------- Baselines ---------
-class DnCNN(nn.Module):
-    def __init__(self, depth=17, n_channels=64, image_channels=3, kernel_size=3):
-        super().__init__()
-        padding = kernel_size // 2
-        layers = [nn.Conv2d(image_channels, n_channels, kernel_size, padding=padding), nn.ReLU(inplace=True)]
-        for _ in range(depth - 2):
-            layers += [nn.Conv2d(n_channels, n_channels, kernel_size, padding=padding),
-                       make_norm(n_channels), nn.ReLU(inplace=True)]
-        layers += [nn.Conv2d(n_channels, image_channels, kernel_size, padding=padding)]
-        self.net = nn.Sequential(*layers)
-    def forward(self, x):
-        return (x - self.net(x)).clamp(0, 1)
-
-class FFDNet(nn.Module):
-    def __init__(self, n_channels=64, image_channels=3):
-        super().__init__()
-        self.head = nn.Conv2d(image_channels + 1, n_channels, 3, padding=1)
-        body = []
-        for _ in range(7):
-            body += [nn.Conv2d(n_channels, n_channels, 3, padding=1), nn.ReLU(inplace=True)]
-        self.body = nn.Sequential(*body)
-        self.tail = nn.Conv2d(n_channels, image_channels, 3, padding=1)
-    def forward(self, x, sigma_map):
-        h = torch.cat([x, sigma_map], dim=1)
-        h = F.relu(self.head(h), inplace=True)
-        h = self.body(h)
-        noise = self.tail(h)
-        return (x - noise).clamp(0, 1)
-
-class UNetBlock(nn.Module):
-    def __init__(self, in_ch, out_ch):
-        super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, 3, padding=1), nn.ReLU(inplace=True),
-            nn.Conv2d(out_ch, out_ch, 3, padding=1), nn.ReLU(inplace=True)
-        )
-    def forward(self, x): return self.conv(x)
-
-class UNet(nn.Module):
-    def __init__(self, image_channels=3):
-        super().__init__()
-        self.enc1, self.enc2 = UNetBlock(image_channels, 64), UNetBlock(64, 128)
-        self.pool = nn.MaxPool2d(2)
-        self.dec1, self.dec2 = UNetBlock(128, 64), UNetBlock(64, 64)
-        self.final = nn.Conv2d(64, image_channels, 1)
-    def forward(self, x):
-        e1 = self.enc1(x)
-        e2 = self.enc2(self.pool(e1))
-        d = F.interpolate(e2, scale_factor=2, mode="nearest")
-        d = self.dec1(d)
-        d = self.dec2(d + e1)
-        return (x - self.final(d)).clamp(0, 1)
-
-class RestormerLite(nn.Module):
-    def __init__(self, image_channels=3, embed_dim=48, num_heads=4, depth=2):
-        super().__init__()
-        self.proj = nn.Conv2d(image_channels, embed_dim, 1)
-        self.blocks = nn.ModuleList([
-            nn.ModuleList([
-                nn.MultiheadAttention(embed_dim, num_heads, batch_first=True),
-                nn.Sequential(nn.Linear(embed_dim, embed_dim*2), nn.ReLU(), nn.Linear(embed_dim*2, embed_dim))
-            ]) for _ in range(depth)
-        ])
-        self.out = nn.Conv2d(embed_dim, image_channels, 1)
-    def forward(self, x):
-        B, C, H, W = x.shape
-        h = self.proj(x).flatten(2).transpose(1, 2)  # [B, HW, C]
-        for attn, mlp in self.blocks:
-            a, _ = attn(h, h, h, need_weights=False)  # avoid computing attn weights
-            h = h + a
-            h = h + mlp(h)
-        h = h.transpose(1, 2).reshape(B, -1, H, W)
-        noise = self.out(h)
-        return (x - noise).clamp(0, 1)
 
 # --------- PU-Net++ (core & wrapper) ---------
 class ConvBlock(nn.Module):
@@ -732,10 +661,6 @@ def train_one(model, model_name, train_loader, sigma: int, epochs: int,
 # ----------------
 def make_model(name: str):
     name = name.lower()
-    if name == "dncnn":           return DnCNN(), False
-    if name == "ffdnet":          return FFDNet(), True
-    if name == "unet":            return UNet(), False
-    if name == "restormer":       return RestormerLite(), False
     if name == "punetpp":         return PUNetPP(base=32), False
     if name in ("punetg","pu_net_g","punet_g"): return PUNetG(base=48), True
     if name == "WIPUNet":    return WIPUNet(), True
@@ -788,92 +713,7 @@ recalib_path = os.path.join(ckpt_dir, f"WIPUNet_sigma{CFG['sigma']}_last_recalib
 torch.save({"model":"WIPUNet","sigma":CFG["sigma"],"model_state":model.state_dict()}, recalib_path)
 print("[save] recalibrated ckpt ->", recalib_path)
 
-##########################################################
-
-
 '''
-##########################################################
-### --- Run dncnn ###
-train_loader, test_loader = make_loaders(CFG["batch_size"], CFG["num_workers"])
-model, needs_sigma = make_model("dncnn")
-model = train_one(model, "dncnn", train_loader, CFG["sigma"], CFG["epochs"],
-                  OUTDIR, needs_sigma, CFG["amp"], CFG["use_compile"], save_every=CFG["save_every"])
-psnr, ssim = eval_one(model, "dncnn", test_loader, CFG["sigma"], needs_sigma)
-print(f"[test] DnCNN σ={CFG['sigma']}: PSNR={psnr:.2f} dB | SSIM={ssim:.3f}")
-
-##########################################################
-### --- Run ffdnet ###
-train_loader, test_loader = make_loaders(CFG["batch_size"], CFG["num_workers"])
-model, needs_sigma = make_model("ffdnet")
-model = train_one(model, "ffdnet", train_loader, CFG["sigma"], CFG["epochs"],
-                  OUTDIR, needs_sigma, CFG["amp"], CFG["use_compile"], save_every=CFG["save_every"])
-psnr, ssim = eval_one(model, "ffdnet", test_loader, CFG["sigma"], needs_sigma)
-print(f"[test] FFDNet σ={CFG['sigma']}: PSNR={psnr:.2f} dB | SSIM={ssim:.3f}")
-
-##########################################################
-### --- Run unet ###
-train_loader, test_loader = make_loaders(CFG["batch_size"], CFG["num_workers"])
-model, needs_sigma = make_model("unet")
-model = train_one(model, "unet", train_loader, CFG["sigma"], CFG["epochs"],
-                  OUTDIR, needs_sigma, CFG["amp"], CFG["use_compile"], save_every=CFG["save_every"])
-psnr, ssim = eval_one(model, "unet", test_loader, CFG["sigma"], needs_sigma)
-print(f"[test] UNet σ={CFG['sigma']}: PSNR={psnr:.2f} dB | SSIM={ssim:.3f}")
-
-##########################################################
-
-# --- FAST RestormerLite run (smaller model + mem-efficient attention) ---
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"  # reduce fragmentation
-if torch.cuda.is_available():
-    torch.cuda.empty_cache()
-gc.collect()
-
-# Prefer mem-efficient scaled dot-product attention (good on T4)
-try:
-    from torch.backends.cuda import sdp_kernel
-    sdp_kernel.enable_flash_sdp(False)        # flash needs Ampere (T4 won't use it)
-    sdp_kernel.enable_math_sdp(False)         # avoid slow math fallback
-    sdp_kernel.enable_mem_efficient_sdp(True) # Triton mem-efficient attention
-    print("[attn] mem-efficient SDPA enabled")
-except Exception as e:
-    print("[attn] SDPA config skipped:", e)
-
-# Use a larger batch now that the model is lighter (fallback to 128 if OOM)
-restormer_batch = 256
-
-# Smaller Restormer is dramatically faster than 48x4-heads:
-embed_dim = 32
-num_heads = 2
-depth = 2
-
-train_loader, test_loader = make_loaders(restormer_batch, CFG["num_workers"])
-
-# Instantiate the lighter model directly (skip make_model's default size)
-fast_model = RestormerLite(embed_dim=embed_dim, num_heads=num_heads, depth=depth)
-needs_sigma = False
-
-# torch.compile can help now that the model is smaller; keep AMP on
-model = train_one(
-    fast_model, "restormer_fast",
-    train_loader, CFG["sigma"], CFG["epochs"],
-    OUTDIR, needs_sigma,
-    amp=CFG["amp"],
-    use_compile=True,                      # was False before; True usually speeds this up
-    save_every=CFG.get("save_every", 10)
-)
-
-psnr, ssim = eval_one(model, "restormer_fast", test_loader, CFG["sigma"], needs_sigma)
-print(f"[test] RestormerFast σ={CFG['sigma']}: PSNR={psnr:.2f} dB | SSIM={ssim:.3f}")
-
-##########################################################
-### --- Run punetpp ##
-train_loader, test_loader = make_loaders(CFG["batch_size"], CFG["num_workers"])
-model, needs_sigma = make_model("punetpp")
-model = train_one(model, "punetpp", train_loader, CFG["sigma"], CFG["epochs"],
-                  OUTDIR, needs_sigma, CFG["amp"], CFG["use_compile"], save_every=CFG["save_every"])
-psnr, ssim = eval_one(model, "punetpp", test_loader, CFG["sigma"], needs_sigma)
-print(f"[test] PUNetPP σ={CFG['sigma']}: PSNR={psnr:.2f} dB | SSIM={ssim:.3f}")
-
-
 ##########################################################
 ### --- Run punetg ##
 train_loader, test_loader = make_loaders(CFG["batch_size"], CFG["num_workers"])
@@ -882,54 +722,14 @@ model = train_one(model, "punetg", train_loader, CFG["sigma"], CFG["epochs"],
                   OUTDIR, needs_sigma, CFG["amp"], CFG["use_compile"], save_every=CFG["save_every"])
 psnr, ssim = eval_one(model, "punetg", test_loader, CFG["sigma"], needs_sigma)
 print(f"[test] PUNetG σ={CFG['sigma']}: PSNR={psnr:.2f} dB | SSIM={ssim:.3f}")
-
-'''
-
-
-'''
-##########################################################
-### Evaluate with a specific saved checkpoint 
 ##########################################################
 
-# --- Recreate data + model
+### --- Run punetpp ##
 train_loader, test_loader = make_loaders(CFG["batch_size"], CFG["num_workers"])
-model, needs_sigma = make_model("punetg")
-model = model.to(DEVICE)
-
-# --- Checkpoint to test
-ckpt_path = "/eos/atlas/unpledged/group-wisc/users/waislam/denoise_PU/denoise_results/checkpoints/punetg_sigma15_epoch50.pth"
-assert os.path.exists(ckpt_path), f"Checkpoint not found: {ckpt_path}"
-
-# --- Load & sanitize state_dict (handles torch.compile/_orig_mod and DataParallel/module)
-def _sanitize(sd):
-    new_sd = {}
-    for k, v in sd.items():
-        if k.startswith("_orig_mod."):
-            k = k[len("_orig_mod."):]
-        if k.startswith("module."):
-            k = k[len("module."):]
-        new_sd[k] = v
-    return new_sd
-
-ckpt = torch.load(ckpt_path, map_location=DEVICE)
-state = ckpt.get("model_state", ckpt)  # support raw state_dict or wrapped
-state = _sanitize(state)
-
-missing, unexpected = model.load_state_dict(state, strict=False)
-if missing or unexpected:
-    print("[warn] load_state_dict mismatches:")
-    if missing:   print("  missing:",   missing)
-    if unexpected:print("  unexpected:", unexpected)
-
-print(f"[ckpt] Loaded {ckpt_path} (epoch {ckpt.get('epoch','?')})")
-
-# --- (Optional) BN recalibration to avoid NaNs / poor eval due to stale running stats
-# Only do this if you see bad BN stats or eval is unstable.
-# recalibrate_bn(model, train_loader, sigma=CFG["sigma"], is_sigma_model=needs_sigma, steps=CFG.get("bn_calibrate_steps", 200))
-
-# --- Evaluate
-psnr, ssim = eval_one(model, "punetg", test_loader, CFG["sigma"], needs_sigma)
-print(f"[test @epoch{ckpt.get('epoch','?')}] PUNetG σ={CFG['sigma']}: PSNR={psnr:.2f} dB | SSIM={ssim:.3f}")
-'''
-
+model, needs_sigma = make_model("punetpp")
+model = train_one(model, "punetpp", train_loader, CFG["sigma"], CFG["epochs"],
+                  OUTDIR, needs_sigma, CFG["amp"], CFG["use_compile"], save_every=CFG["save_every"])
+psnr, ssim = eval_one(model, "punetpp", test_loader, CFG["sigma"], needs_sigma)
+print(f"[test] PUNetPP σ={CFG['sigma']}: PSNR={psnr:.2f} dB | SSIM={ssim:.3f}")
 ##########################################################
+'''
