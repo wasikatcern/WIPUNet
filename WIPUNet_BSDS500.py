@@ -1,8 +1,10 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+#####################################
+###### Prepared by Wasikul Islam ####
+### contact: wasikul.islam@cern.ch ##
+#####################################
 
 """
-python WIPUNet_BSDS500.py   --bsds_root /eos/atlas/unpledged/group-wisc/users/waislam/denoise_PU/data/BSDS500/BSR   --split train   --ckpt_dir ./denoise_results   --models WIPUNet dncnn ffdnet unet  punetg restormer --sigma_list 15 25 50 --epochs 50   --batch_size 64   --num_workers 4   --amp   --save_every 10   --lr 5e-4 --clip_grad 1.0
+python WIPUNet_BSDS500.py   --bsds_root /eos/atlas/unpledged/group-wisc/users/waislam/denoise_PU/data/BSDS500/BSR   --split train   --ckpt_dir ./denoise_results   --models WIPUNet punetg --sigma_list 15 25 50 --epochs 50   --batch_size 64   --num_workers 4   --amp   --save_every 10   --lr 5e-4 --clip_grad 1.0
 """
 
 import os, glob, time, argparse, random
@@ -166,59 +168,6 @@ class ResBlock(nn.Module):
         h = self.se(h)
         return F.relu(x + h, inplace=True)
 
-class DnCNN(nn.Module):
-    def __init__(self, depth=17, n_channels=64, image_channels=3, kernel_size=3):
-        super().__init__()
-        padding = kernel_size // 2
-        layers = [nn.Conv2d(image_channels, n_channels, kernel_size, padding=padding), nn.ReLU(inplace=True)]
-        for _ in range(depth - 2):
-            layers += [nn.Conv2d(n_channels, n_channels, kernel_size, padding=padding),
-                       make_norm(n_channels), nn.ReLU(inplace=True)]
-        layers += [nn.Conv2d(n_channels, image_channels, kernel_size, padding=padding)]
-        self.net = nn.Sequential(*layers)
-    def forward(self, x):
-        return (x - self.net(x)).clamp(0, 1)
-
-class FFDNet(nn.Module):
-    def __init__(self, n_channels=64, image_channels=3):
-        super().__init__()
-        self.head = nn.Conv2d(image_channels + 1, n_channels, 3, padding=1)
-        body = []
-        for _ in range(7):
-            body += [nn.Conv2d(n_channels, n_channels, 3, padding=1), nn.ReLU(inplace=True)]
-        self.body = nn.Sequential(*body)
-        self.tail = nn.Conv2d(n_channels, image_channels, 3, padding=1)
-    def forward(self, x, sigma_map):
-        h = torch.cat([x, sigma_map], dim=1)
-        h = F.relu(self.head(h), inplace=True)
-        h = self.body(h)
-        noise = self.tail(h)
-        return (x - noise).clamp(0, 1)
-
-class UNetBlock(nn.Module):
-    def __init__(self, in_ch, out_ch):
-        super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_ch, out_ch, 3, padding=1), nn.ReLU(inplace=True),
-            nn.Conv2d(out_ch, out_ch, 3, padding=1), nn.ReLU(inplace=True)
-        )
-    def forward(self, x): return self.conv(x)
-
-class UNet(nn.Module):
-    def __init__(self, image_channels=3):
-        super().__init__()
-        self.enc1, self.enc2 = UNetBlock(image_channels, 64), UNetBlock(64, 128)
-        self.pool = nn.MaxPool2d(2)
-        self.dec1, self.dec2 = UNetBlock(128, 64), UNetBlock(64, 64)
-        self.final = nn.Conv2d(64, image_channels, 1)
-    def forward(self, x):
-        e1 = self.enc1(x)
-        e2 = self.enc2(self.pool(e1))
-        d = F.interpolate(e2, scale_factor=2, mode="nearest")
-        d = self.dec1(d)
-        d = self.dec2(d + e1)
-        return (x - self.final(d)).clamp(0, 1)
-
 class DownLearned(nn.Module):
     def __init__(self, c_in, c_out, use_se=True):
         super().__init__()
@@ -374,98 +323,6 @@ class PUNetG(nn.Module):
     def forward(self, x, sigma_map):
         S_hat, _ = self.core(x, sigma_map)
         return S_hat
-    
-
-# ---- RestormerLite (windowed attention; reshape-safe) ----
-class RestormerLite(nn.Module):
-    """
-    Windowed self-attention Restormer-lite:
-      conv embed -> (MHSA+MLP) x depth over non-overlapping W×W windows -> conv out
-    Uses reshape() instead of view() to handle non-contiguous tensors.
-    """
-    def __init__(self, image_channels=3, embed_dim=48, num_heads=4, depth=2, window=8):
-        super().__init__()
-        assert embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
-        self.embed_dim = embed_dim
-        self.num_heads = num_heads
-        self.depth = depth
-        self.window = window
-
-        self.proj = nn.Conv2d(image_channels, embed_dim, 1)
-
-        blocks = []
-        for _ in range(depth):
-            blocks.append(nn.ModuleList([
-                nn.MultiheadAttention(embed_dim, num_heads, batch_first=True),
-                nn.Sequential(
-                    nn.Linear(embed_dim, embed_dim * 2),
-                    nn.ReLU(inplace=True),
-                    nn.Linear(embed_dim * 2, embed_dim),
-                )
-            ]))
-        self.blocks = nn.ModuleList(blocks)
-
-        self.out = nn.Conv2d(embed_dim, image_channels, 1)
-
-    def _windows_from_embed(self, e: torch.Tensor):
-        """
-        e: [B, C, H, W] -> tokens: [B*nw, W*W, C]
-        Returns tokens and meta (B, Hpad, Wpad, num_windows).
-        """
-        B, C, H, W = e.shape
-        ws = self.window
-
-        # pad to multiples of ws
-        pad_h = (ws - (H % ws)) % ws
-        pad_w = (ws - (W % ws)) % ws
-        if pad_h or pad_w:
-            e = F.pad(e, (0, pad_w, 0, pad_h))
-        Hpad, Wpad = e.shape[-2:]
-
-        # unfold -> [B, C*ws*ws, num_windows]
-        u = F.unfold(e, kernel_size=ws, stride=ws)
-        num_windows = (Hpad // ws) * (Wpad // ws)
-
-        # [B, num_windows, C*ws*ws]
-        u = u.permute(0, 2, 1).contiguous()
-
-        # [B*num_windows, ws*ws, C]
-        u = u.reshape(B * num_windows, C, ws * ws).permute(0, 2, 1).contiguous()
-        return u, (B, Hpad, Wpad, num_windows)
-
-    def _embed_from_windows(self, tokens: torch.Tensor, meta):
-        """
-        tokens: [B*nw, W*W, C] -> [B, C, Hpad, Wpad]
-        """
-        B, Hpad, Wpad, num_windows = meta
-        ws = self.window
-        C = tokens.shape[-1]
-
-        # [B, num_w, S, C]
-        x = tokens.reshape(B, num_windows, ws * ws, C)
-        # [B, C*S, num_w]
-        x = x.permute(0, 3, 2, 1).contiguous()
-        x = x.reshape(B, C * ws * ws, num_windows)
-
-        # fold back -> [B, C, Hpad, Wpad]
-        e = F.fold(x, output_size=(Hpad, Wpad), kernel_size=ws, stride=ws)
-        return e
-
-    def forward(self, x):
-        B, C, H, W = x.shape
-        e = self.proj(x)  # [B, E, H, W]
-
-        tokens, meta = self._windows_from_embed(e)  # [B*nw, S, E]
-        for attn, mlp in self.blocks:
-            a, _ = attn(tokens, tokens, tokens)
-            tokens = tokens + a
-            tokens = tokens + mlp(tokens)
-
-        e2 = self._embed_from_windows(tokens, meta)  # [B, E, Hpad, Wpad]
-        e2 = e2[:, :, :H, :W]  # crop if padded
-
-        noise = self.out(e2)
-        return (x - noise).clamp(0, 1)
 
 # ------------------
 # Training / Eval
@@ -593,10 +450,6 @@ def make_bsds_loader(root: str, split: str, img_size_eval: int, batch_size: int,
 
 def make_model(name: str) -> Tuple[nn.Module, bool]:
     name = name.lower()
-    if name == "dncnn":           return DnCNN(), False
-    if name == "ffdnet":          return FFDNet(), True
-    if name == "unet":            return UNet(), False
-    if name == "restormer":       return RestormerLite(), False
     if name == "WIPUNet":    return WIPUNet(), True
     if name in ("punetg", "pu_net_g", "punet_g"): return PUNetG(base=48), True
     raise ValueError(f"Unknown model '{name}'")
@@ -638,7 +491,7 @@ def main():
     ap.add_argument("--bsds_root", type=str, required=True, help="Path to BSDS500 root (containing BSDS500/data/images/{train,val,test}) or images/<split> directly")
     ap.add_argument("--split", type=str, default="test", choices=["train","val","test"])
     ap.add_argument("--ckpt_dir", type=str, default="./denoise_results", help="Where checkpoints were saved")
-    ap.add_argument("--models", nargs="+", default=["dncnn","ffdnet","unet","WIPUNet"])
+    ap.add_argument("--models", nargs="+", default=["WIPUNet", "punetg"])
     ap.add_argument("--sigma_list", nargs="+", type=int, default=[15,25,50])
     ap.add_argument("--img_size_eval", type=int, default=128)
     ap.add_argument("--batch_size", type=int, default=64)
